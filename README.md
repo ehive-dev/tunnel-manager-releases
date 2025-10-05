@@ -6,5 +6,4 @@ Dieses Repository enthält **öffentliche Builds** des Tunnel Managers
 ## Installation (Beispiel für DietPi / Debian ARM64)
 
 ```bash
-wget https://github.com/<dein-user>/cloudflare-tunnel-manager-releases/releases/download/v1.0.0/cloudflared-manager_1.0.0_arm64.deb
-sudo apt install ./cloudflared-manager_1.0.0_arm64.deb
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ehive-dev/tunnel-manager-releases/main/install.sh)"
