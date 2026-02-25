@@ -8,14 +8,19 @@ umask 022
 #   sudo bash install.sh --pre           # neueste PRE-RELEASE (fällt auf Stable zurück, wenn kein Pre)
 #   sudo bash install.sh --tag v0.1.1    # bestimmte Version
 #   sudo bash install.sh --repo owner/repo
+#   sudo bash install.sh --console       # zusätzlich eHive Console (ttyd) installieren/aktivieren
 #
 # Optional: export GITHUB_TOKEN=... (höhere API-Limits/private Repos)
+# Optional: export TTYD_VER=1.7.7
 
 APP_NAME="tunnel-manager"
 REPO="${REPO:-ehive-dev/tunnel-manager-releases}"  # per --repo überschreibbar
 CHANNEL="stable"    # stable | pre  (fallback jeweils auf das andere, falls leer)
 TAG="${TAG:-}"      # vX.Y.Z (mit v)
 ARCH_REQ="arm64"
+
+INSTALL_CONSOLE=false
+TTYD_VER="${TTYD_VER:-1.7.7}"
 
 # ---------- CLI-Args ----------
 while [[ $# -gt 0 ]]; do
@@ -24,8 +29,9 @@ while [[ $# -gt 0 ]]; do
     --stable) CHANNEL="stable"; shift ;;
     --tag) TAG="${2:-}"; shift 2 ;;
     --repo) REPO="${2:-}"; shift 2 ;;
+    --console) INSTALL_CONSOLE=true; shift ;;
     -h|--help)
-      echo "Usage: sudo $0 [--pre|--stable] [--tag vX.Y.Z] [--repo owner/repo]"
+      echo "Usage: sudo $0 [--pre|--stable] [--tag vX.Y.Z] [--repo owner/repo] [--console]"
       exit 0
       ;;
     *) echo "Unknown arg: $1" >&2; exit 1 ;;
@@ -44,9 +50,11 @@ need_root(){
     exit 1
   fi
 }
+
 need_tools(){
   command -v curl >/dev/null || { apt-get update -y; apt-get install -y curl; }
   command -v jq   >/dev/null || { apt-get update -y; apt-get install -y jq; }
+  command -v ca-certificates >/dev/null 2>&1 || { apt-get update -y; apt-get install -y ca-certificates; }
   command -v ss   >/dev/null || true
 }
 
@@ -117,6 +125,70 @@ wait_health(){
   local url="$1"
   for i in {1..30}; do curl -fsS "$url" >/dev/null && return 0; sleep 1; done
   return 1
+}
+
+install_console(){
+  info "Installiere eHive Console (ttyd) ..."
+
+  case "$(uname -m)" in
+    aarch64|arm64) ;;
+    *) warn "Konsole: nur aarch64/arm64 unterstützt (uname -m: $(uname -m)) – überspringe."; return 0 ;;
+  esac
+
+  command -v sha256sum >/dev/null 2>&1 || { apt-get update -y; apt-get install -y coreutils; }
+  command -v systemctl >/dev/null 2>&1 || { warn "systemctl fehlt – überspringe Konsole."; return 0; }
+
+  local BIN="/usr/local/bin/ttyd"
+  local UNIT="/etc/systemd/system/ehive-console.service"
+  local PORT="3004"
+  local BIND="127.0.0.1"
+
+  local tmp
+  tmp="$(mktemp -d -t ehive-console.XXXXX)"
+  # kein extra trap (bestehender EXIT-trap bleibt für $TMPDIR der .deb-Installation)
+  info "Lade ttyd ${TTYD_VER} (ttyd.aarch64) ..."
+  curl -fL --retry 3 --retry-delay 1 -o "${tmp}/ttyd.aarch64" \
+    "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VER}/ttyd.aarch64"
+
+  curl -fL --retry 3 --retry-delay 1 -o "${tmp}/SHA256SUMS" \
+    "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VER}/SHA256SUMS"
+
+  ( cd "$tmp" && grep " ttyd.aarch64\$" SHA256SUMS | sha256sum -c - ) || { rm -rf "$tmp"; err "Konsole: SHA256 Check fehlgeschlagen."; return 1; }
+
+  install -m 0755 "${tmp}/ttyd.aarch64" "$BIN"
+  rm -rf "$tmp"
+
+  # optional: lrzsz (sz/rz) – best effort, darf nicht fatal sein
+  if ! command -v sz >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y lrzsz >/dev/null 2>&1 || warn "Konsole: lrzsz nicht installierbar (sz/rz Transfer ggf. nicht verfügbar)."
+  fi
+
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=eHive Browser Console (ttyd)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${BIN} -p ${PORT} -i ${BIND} -W -m 1 -O -t enableZmodem=true /bin/login
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload || true
+  systemctl enable ehive-console.service >/dev/null 2>&1 || true
+  systemctl restart ehive-console.service >/dev/null 2>&1 || true
+
+  if curl -fsSI "http://${BIND}:${PORT}" >/dev/null 2>&1; then
+    ok "Konsole aktiv: http://${BIND}:${PORT} (localhost-only)"
+  else
+    warn "Konsole gestartet, aber HTTP-Check fehlgeschlagen: http://${BIND}:${PORT}"
+  fi
 }
 
 # ---------- Start ----------
@@ -197,3 +269,7 @@ wait_health "$URL" || { err "Health-Check fehlgeschlagen."; journalctl -u "$APP_
 
 NEW_VER="$(installed_version || echo "$VER_CLEAN")"
 ok "Fertig: ${APP_NAME} ${OLD_VER:+${OLD_VER} → }${NEW_VER} (healthy @ ${URL})"
+
+if $INSTALL_CONSOLE; then
+  install_console
+fi
