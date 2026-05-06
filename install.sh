@@ -2,47 +2,34 @@
 set -euo pipefail
 umask 022
 
-# tunnel-manager Installer/Updater (Debian/Ubuntu, arm64)
-# Usage:
-#   sudo bash install.sh                 # neueste STABLE (fällt auf PRE zurück, wenn kein Stable)
-#   sudo bash install.sh --pre           # neueste PRE-RELEASE (fällt auf Stable zurück, wenn kein Pre)
-#   sudo bash install.sh --tag v0.1.1    # bestimmte Version
-#   sudo bash install.sh --repo owner/repo
-#   sudo bash install.sh --console       # zusätzlich eHive Console (ttyd) installieren/aktivieren
-#
-# Optional: export GITHUB_TOKEN=... (höhere API-Limits/private Repos)
-# Optional: export TTYD_VER=1.7.7
+APP_DISPLAY="tunnel-manager"
+PKG_NAME="tunnel-manager"
+SERVICE_NAME="tunnel-manager"
+REPO="${REPO:-ehive-dev/tunnel-manager-releases}"
+TAG="${TAG:-}"
+CHANNEL="${CHANNEL:-stable}"
+ASSET_PREFIXES="tunnel-manager tunnel_manager"
+ARCH_ORDER="arm64 aarch64"
+HEALTH_URL="http://127.0.0.1:3005/healthz"
 
-APP_NAME="tunnel-manager"
-REPO="${REPO:-ehive-dev/tunnel-manager-releases}"  # per --repo überschreibbar
-CHANNEL="stable"    # stable | pre  (fallback jeweils auf das andere, falls leer)
-TAG="${TAG:-}"      # vX.Y.Z (mit v)
-ARCH_REQ="arm64"
-
-INSTALL_CONSOLE=false
-TTYD_VER="${TTYD_VER:-1.7.7}"
-
-# ---------- CLI-Args ----------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --pre) CHANNEL="pre"; shift ;;
-    --stable) CHANNEL="stable"; shift ;;
     --tag) TAG="${2:-}"; shift 2 ;;
     --repo) REPO="${2:-}"; shift 2 ;;
-    --console) INSTALL_CONSOLE=true; shift ;;
+    --pre) CHANNEL="pre"; shift ;;
+    --stable) CHANNEL="stable"; shift ;;
     -h|--help)
-      echo "Usage: sudo $0 [--pre|--stable] [--tag vX.Y.Z] [--repo owner/repo] [--console]"
+      echo "Usage: sudo $0 [--tag vX.Y.Z] [--repo owner/repo] [--stable|--pre]"
       exit 0
       ;;
     *) echo "Unknown arg: $1" >&2; exit 1 ;;
   esac
 done
 
-# ---------- Helpers ----------
 info(){ printf '\033[1;34m[i]\033[0m %s\n' "$*"; }
-ok(){   printf '\033[1;32m[✓]\033[0m %s\n' "$*"; }
+ok(){ printf '\033[1;32m[✓]\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
-err(){  printf '\033[1;31m[✗]\033[0m %s\n' "$*" >&2; }
+err(){ printf '\033[1;31m[✗]\033[0m %s\n' "$*" >&2; }
 
 need_root(){
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -53,9 +40,23 @@ need_root(){
 
 need_tools(){
   command -v curl >/dev/null || { apt-get update -y; apt-get install -y curl; }
-  command -v jq   >/dev/null || { apt-get update -y; apt-get install -y jq; }
+  command -v dpkg-deb >/dev/null || { apt-get update -y; apt-get install -y dpkg; }
   command -v ca-certificates >/dev/null 2>&1 || { apt-get update -y; apt-get install -y ca-certificates; }
-  command -v ss   >/dev/null || true
+}
+
+installed_version(){
+  dpkg-query -W -f='${Version}\n' "$PKG_NAME" 2>/dev/null || true
+}
+
+resolve_latest_tag(){
+  local effective
+  effective="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" || true)"
+  effective="${effective%%[?#]*}"
+  if [[ "$effective" == */tag/* ]]; then
+    printf '%s\n' "${effective##*/tag/}"
+    return 0
+  fi
+  return 1
 }
 
 api(){
@@ -65,215 +66,143 @@ api(){
     return
   fi
   local hdr=(-H "Accept: application/vnd.github+json")
-  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    hdr+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  if [[ -n "${GITHUB_TOKEN:-${GH_TOKEN:-}}" ]]; then
+    hdr+=(-H "Authorization: Bearer ${GITHUB_TOKEN:-${GH_TOKEN:-}}")
   fi
   curl -fsSL "${hdr[@]}" "$url"
 }
 
-# Trimmt CR/LF/Spaces komplett weg → einzeilige URL
-trim_one_line(){
-  tr -d '\r' | tr -d '\n' | sed 's/[[:space:]]\+$//'
-}
-
-# Holt JSON EINER Release. Mit Fallback: stable→pre bzw. pre→stable
-get_release_json(){
+resolve_tag(){
   if [[ -n "$TAG" ]]; then
-    api "https://api.github.com/repos/${REPO}/releases/tags/${TAG}"
+    printf '%s\n' "$TAG"
     return
   fi
-  # Liste laden und je nach CHANNEL bevorzugen; wenn leer, auf anderes umschalten
-  local releases
-  releases="$(api "https://api.github.com/repos/${REPO}/releases?per_page=50")"
-  printf '%s' "$releases" | jq -c --arg ch "$CHANNEL" '
-    [ .[] | select(.draft==false) ] as $r
-    | if $ch=="pre"
-      then ( $r | map(select(.prerelease==true)) | .[0] ) // ( $r | map(select(.prerelease==false)) | .[0] )
-      else ( $r | map(select(.prerelease==false)) | .[0] ) // ( $r | map(select(.prerelease==true)) | .[0] )
-      end
-  '
-}
-
-# Erwartet JSON EINER Release auf stdin, gibt EXAKT EINE .deb-URL zurück (oder leer)
-pick_deb_from_release(){
-  jq -r --arg arch "$ARCH_REQ" '
-    .assets // []
-    | map(select(.name
-        | test("^(tunnel-manager|tunnel[_-]?manager)_.*_("+$arch+"|aarch64)\\.deb$")))
-    | .[0].browser_download_url // empty
-  '
-}
-
-installed_version(){
-  dpkg-query -W -f='${Version}\n' "$APP_NAME" 2>/dev/null || true
-}
-
-get_port(){
-  local p="3005"  # Default bei tunnel-manager
-  if [[ -r "/etc/default/${APP_NAME}" ]]; then
-    # shellcheck disable=SC1091
-    . "/etc/default/${APP_NAME}" || true
-    p="${PORT:-$p}"
+  if [[ "$CHANNEL" == "stable" ]]; then
+    resolve_latest_tag && return
   fi
-  echo "$p"
+  command -v jq >/dev/null || { apt-get update -y; apt-get install -y jq; }
+  api "https://api.github.com/repos/${REPO}/releases?per_page=50" |
+    jq -r --arg ch "$CHANNEL" '
+      [ .[] | select(.draft==false) ] as $r
+      | if $ch=="pre"
+        then (($r | map(select(.prerelease==true)) | .[0]) // ($r | map(select(.prerelease==false)) | .[0]))
+        else (($r | map(select(.prerelease==false)) | .[0]) // ($r | map(select(.prerelease==true)) | .[0]))
+        end
+      | .tag_name // empty
+    '
 }
 
-wait_port(){
-  local port="$1"
-  command -v ss >/dev/null 2>&1 || return 0
-  for i in {1..60}; do ss -ltn 2>/dev/null | grep -q ":${port} " && return 0; sleep 0.5; done
+asset_exists(){
+  curl -fsIL --retry 2 --retry-delay 1 "$1" >/dev/null 2>&1
+}
+
+resolve_deb_url(){
+  local tag="$1" ver="${tag#v}" prefix arch url
+  for prefix in $ASSET_PREFIXES; do
+    for arch in $ARCH_ORDER; do
+      url="https://github.com/${REPO}/releases/download/${tag}/${prefix}_${ver}_${arch}.deb"
+      if asset_exists "$url"; then
+        printf '%s\n' "$url"
+        return 0
+      fi
+    done
+  done
+
+  command -v jq >/dev/null || { apt-get update -y; apt-get install -y jq; }
+  api "https://api.github.com/repos/${REPO}/releases/tags/${tag}" |
+    jq -r --arg prefixes "$ASSET_PREFIXES" --arg arches "$ARCH_ORDER" '
+      ($prefixes | split(" ")) as $p
+      | ($arches | split(" ")) as $a
+      | .assets // []
+      | map(select(.name as $n | any($p[]; . as $pre | any($a[]; $n == ($pre + "_" + (.tag_name // "" | ltrimstr("v")) + "_" + . + ".deb")))))
+      | .[0].browser_download_url // empty
+    ' 2>/dev/null || true
+}
+
+stop_service(){
+  [[ -n "$SERVICE_NAME" ]] || return 0
+  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+}
+
+start_service(){
+  [[ -n "$SERVICE_NAME" ]] || return 0
+  systemctl daemon-reload || true
+  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl restart "$SERVICE_NAME" || true
+}
+
+wait_service(){
+  [[ -n "$SERVICE_NAME" ]] || return 0
+  for _ in {1..30}; do
+    systemctl is-active --quiet "$SERVICE_NAME" && return 0
+    sleep 1
+  done
   return 1
 }
 
 wait_health(){
-  local url="$1"
-  for i in {1..30}; do curl -fsS "$url" >/dev/null && return 0; sleep 1; done
+  [[ -n "$HEALTH_URL" ]] || return 0
+  for _ in {1..30}; do
+    curl -fsS "$HEALTH_URL" >/dev/null && return 0
+    sleep 1
+  done
   return 1
 }
 
-install_console(){
-  info "Installiere eHive Console (ttyd) ..."
-
-  case "$(uname -m)" in
-    aarch64|arm64) ;;
-    *) warn "Konsole: nur aarch64/arm64 unterstützt (uname -m: $(uname -m)) – überspringe."; return 0 ;;
-  esac
-
-  command -v sha256sum >/dev/null 2>&1 || { apt-get update -y; apt-get install -y coreutils; }
-  command -v systemctl >/dev/null 2>&1 || { warn "systemctl fehlt – überspringe Konsole."; return 0; }
-
-  local BIN="/usr/local/bin/ttyd"
-  local UNIT="/etc/systemd/system/ehive-console.service"
-  local PORT="3004"
-  local BIND="127.0.0.1"
-
-  local tmp
-  tmp="$(mktemp -d -t ehive-console.XXXXX)"
-  # kein extra trap (bestehender EXIT-trap bleibt für $TMPDIR der .deb-Installation)
-  info "Lade ttyd ${TTYD_VER} (ttyd.aarch64) ..."
-  curl -fL --retry 3 --retry-delay 1 -o "${tmp}/ttyd.aarch64" \
-    "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VER}/ttyd.aarch64"
-
-  curl -fL --retry 3 --retry-delay 1 -o "${tmp}/SHA256SUMS" \
-    "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VER}/SHA256SUMS"
-
-  ( cd "$tmp" && grep " ttyd.aarch64\$" SHA256SUMS | sha256sum -c - ) || { rm -rf "$tmp"; err "Konsole: SHA256 Check fehlgeschlagen."; return 1; }
-
-  install -m 0755 "${tmp}/ttyd.aarch64" "$BIN"
-  rm -rf "$tmp"
-
-  # optional: lrzsz (sz/rz) – best effort, darf nicht fatal sein
-  if ! command -v sz >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y lrzsz >/dev/null 2>&1 || warn "Konsole: lrzsz nicht installierbar (sz/rz Transfer ggf. nicht verfügbar)."
-  fi
-
-  cat > "$UNIT" <<EOF
-[Unit]
-Description=eHive Browser Console (ttyd)
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${BIN} -p ${PORT} -i ${BIND} -W -m 1 -O -t enableZmodem=true /bin/login
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload || true
-  systemctl enable ehive-console.service >/dev/null 2>&1 || true
-  systemctl restart ehive-console.service >/dev/null 2>&1 || true
-
-  if curl -fsSI "http://${BIND}:${PORT}" >/dev/null 2>&1; then
-    ok "Konsole aktiv: http://${BIND}:${PORT} (localhost-only)"
-  else
-    warn "Konsole gestartet, aber HTTP-Check fehlgeschlagen: http://${BIND}:${PORT}"
-  fi
-}
-
-# ---------- Start ----------
 need_root
 need_tools
 
-ARCH_SYS="$(dpkg --print-architecture 2>/dev/null || echo unknown)"
-if [[ "$ARCH_SYS" != "$ARCH_REQ" ]]; then
-  warn "Systemarchitektur ist '$ARCH_SYS', Release ist für '$ARCH_REQ'. Abbruch."
-  exit 1
-fi
-
 OLD_VER="$(installed_version || true)"
 if [[ -n "$OLD_VER" ]]; then
-  info "Installiert: ${APP_NAME} ${OLD_VER}"
+  info "Installiert: ${APP_DISPLAY} ${OLD_VER}"
 else
-  info "Keine bestehende ${APP_NAME}-Installation gefunden."
+  info "Keine bestehende ${APP_DISPLAY}-Installation gefunden."
 fi
 
-info "Ermittle Release aus ${REPO} (${CHANNEL}${TAG:+, tag=$TAG}) ..."
-RELEASE_JSON="$(get_release_json)"
-if [[ -z "$RELEASE_JSON" || "$RELEASE_JSON" == "null" ]]; then
-  err "Keine passende Release gefunden."
+info "Ermittle Release aus ${REPO} (${CHANNEL}) ..."
+TAG="$(resolve_tag | head -n1)"
+if [[ -z "$TAG" ]]; then
+  err "Keine passende Release gefunden (Repo: ${REPO})."
   exit 1
 fi
 
-TAG_NAME="$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name')"
-[[ -z "$TAG" ]] && TAG="$TAG_NAME"
 VER_CLEAN="${TAG#v}"
-
-DEB_URL_RAW="$(printf '%s' "$RELEASE_JSON" | pick_deb_from_release || true)"
-DEB_URL="$(printf '%s' "$DEB_URL_RAW" | trim_one_line)"
-
+DEB_URL="$(resolve_deb_url "$TAG" | head -n1)"
 if [[ -z "$DEB_URL" ]]; then
-  err "Kein .deb Asset (arm64/aarch64) in Release ${TAG} gefunden."
+  err "Kein passendes .deb Asset in Release ${TAG} gefunden."
+  err "Repo: ${REPO}"
+  err "Prefixe: ${ASSET_PREFIXES}; Arch: ${ARCH_ORDER}"
   exit 1
 fi
 
-TMPDIR="$(mktemp -d -t tunnel-manager-install.XXXXX)"
+TMPDIR="$(mktemp -d -t "${PKG_NAME}-install.XXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
-DEB_FILE="${TMPDIR}/${APP_NAME}_${VER_CLEAN}_${ARCH_REQ}.deb"
+DEB_FILE="${TMPDIR}/${PKG_NAME}_${VER_CLEAN}.deb"
 
 info "Lade: ${DEB_URL}"
-curl -fL --retry 3 --retry-delay 1 -o "$DEB_FILE" "$DEB_URL"
+curl -fL --retry 5 --retry-delay 1 -o "$DEB_FILE" "$DEB_URL"
+dpkg-deb --info "$DEB_FILE" >/dev/null || { err "Ungültiges .deb Asset."; exit 1; }
 
-# Sanity
-dpkg-deb --info "$DEB_FILE" >/dev/null 2>&1 || { err "Ungültiges .deb"; exit 1; }
-
-# Vorhandenen Service sauber stoppen (dpkg/postinst startet neu)
-if systemctl list-units --type=service | grep -q "^${APP_NAME}\.service"; then
-  systemctl stop "$APP_NAME" || true
-fi
-
+stop_service
 info "Installiere Paket ..."
-set +e
-dpkg -i "$DEB_FILE"
-RC=$?
-set -e
-if [[ $RC -ne 0 ]]; then
-  warn "dpkg -i scheiterte — versuche apt --fix-broken"
+if ! dpkg -i "$DEB_FILE"; then
+  warn "dpkg meldet Abhängigkeiten, versuche apt-get -f install ..."
   apt-get update -y
   apt-get -f install -y
   dpkg -i "$DEB_FILE"
 fi
-ok "Installiert: ${APP_NAME} ${VER_CLEAN}"
 
-systemctl daemon-reload || true
-systemctl enable "$APP_NAME" || true
-systemctl restart "$APP_NAME" || true
-
-PORT="$(get_port)"
-URL="http://127.0.0.1:${PORT}/healthz"
-info "Warte auf Port :${PORT} ..."
-wait_port "$PORT" || { err "Port ${PORT} lauscht nicht."; journalctl -u "$APP_NAME" -n 200 --no-pager -o cat || true; exit 1; }
-
-info "Prüfe Health ${URL} ..."
-wait_health "$URL" || { err "Health-Check fehlgeschlagen."; journalctl -u "$APP_NAME" -n 200 --no-pager -o cat || true; exit 1; }
+start_service
+if ! wait_service; then
+  err "Service ist nicht active: ${SERVICE_NAME}"
+  journalctl -u "$SERVICE_NAME" -n 120 --no-pager -o cat || true
+  exit 1
+fi
+if ! wait_health; then
+  err "Health-Check fehlgeschlagen: ${HEALTH_URL}"
+  journalctl -u "$SERVICE_NAME" -n 120 --no-pager -o cat || true
+  exit 1
+fi
 
 NEW_VER="$(installed_version || echo "$VER_CLEAN")"
-ok "Fertig: ${APP_NAME} ${OLD_VER:+${OLD_VER} → }${NEW_VER} (healthy @ ${URL})"
-
-if $INSTALL_CONSOLE; then
-  install_console
-fi
+ok "Fertig: ${APP_DISPLAY} ${OLD_VER:+${OLD_VER} → }${NEW_VER}"
