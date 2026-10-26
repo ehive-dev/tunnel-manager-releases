@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "sequence": 1,
+  "approvedVersion": "2026.10.4",
+  "minimumSecureVersion": "2026.10.2",
+  "mandatory": true,
+  "publishedAt": "2026-10-26T00:00:00Z",
+  "reason": "Cloudflare security update for compromised eMudhra intermediate certificates"
+}
