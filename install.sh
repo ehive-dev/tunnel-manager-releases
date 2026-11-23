@@ -195,7 +195,7 @@ info "Installiere Paket ..."
 if ! dpkg -i "$DEB_FILE"; then
   warn "dpkg meldet Abhängigkeiten, versuche apt-get -f install ..."
   apt-get update -y
-  apt-get -f install -y
+  apt-get --no-remove -f install -y
   dpkg -i "$DEB_FILE"
 fi
 
