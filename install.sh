@@ -188,15 +188,34 @@ DEB_FILE="${TMPDIR}/${PKG_NAME}_${VER_CLEAN}.deb"
 
 info "Lade: ${DEB_URL}"
 curl -fL --retry 5 --retry-delay 1 -o "$DEB_FILE" "$DEB_URL"
-dpkg-deb --info "$DEB_FILE" >/dev/null || { err "Ungültiges .deb Asset."; exit 1; }
+dpkg-deb --control "$DEB_FILE" "$TMPDIR/control"
+deb_version="$(dpkg-deb -f "$DEB_FILE" Version)"
+if [[ "$(dpkg-deb -f "$DEB_FILE" Package)" != "$PKG_NAME" ||
+      "$(dpkg-deb -f "$DEB_FILE" Architecture)" != "$(dpkg --print-architecture)" ||
+      ( "$deb_version" != "$VER_CLEAN" && "$deb_version" != "${VER_CLEAN/-rc./~rc}" ) ]]; then
+  err "Paketname, Architektur oder Version passen nicht zum ausgewählten Tunnel Manager."
+  exit 1
+fi
+
+# Only opt into replacing conffiles when the package declares just the startup file.
+# Older packages have no conffiles. Keep local values for any other layout.
+config_policy=(--no-force-confdef,confnew --force-confold)
+if [[ -s "$TMPDIR/control/conffiles" ]]; then
+  if [[ "$(cat "$TMPDIR/control/conffiles")" == "/etc/default/tunnel-manager" ]]; then
+    config_policy=(--no-force-confdef,confold --force-confask,confnew,confmiss)
+  else
+    warn "Weitere Konfigurationsdateien im Paket. Lokale Einstellungen werden beibehalten."
+  fi
+fi
+install_package=(dpkg "${config_policy[@]}" --install "$DEB_FILE")
 
 stop_service
 info "Installiere Paket ..."
-if ! dpkg -i "$DEB_FILE"; then
+if ! "${install_package[@]}"; then
   warn "dpkg meldet Abhängigkeiten, versuche apt-get -f install ..."
   apt-get update -y
-  apt-get --no-remove -f install -y
-  dpkg -i "$DEB_FILE"
+  apt-get -o Dpkg::Options::=--force-confold --no-remove -f install -y
+  "${install_package[@]}"
 fi
 
 start_service

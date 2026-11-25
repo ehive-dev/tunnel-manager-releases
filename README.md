@@ -4,6 +4,8 @@ Dieses Repository enthält öffentliche Release-Pakete für den Cloudflare Tunne
 
 ## Schnellstart
 
+Beim Update auf 0.9.28 übernimmt der Installer die Startvorgaben in `/etc/default/tunnel-manager` automatisch. Die lokale Tunnelkonfiguration liegt separat in `/etc/tunnel-manager/.env`.
+
 Stable installieren oder aktualisieren:
 
 ```bash
